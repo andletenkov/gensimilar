@@ -6,11 +6,13 @@ import torch
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import tqdm
 
 
 class Layer(abc.ABC):
     def __init__(self):
         self._out = None
+        self._training = True
 
     @abc.abstractmethod
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
@@ -27,6 +29,14 @@ class Layer(abc.ABC):
     @out.setter
     def out(self, value: torch.Tensor) -> None:
         self._out = value
+
+    @property
+    def training(self) -> bool:
+        return self._training
+
+    @training.setter
+    def training(self, value: bool) -> None:
+        self._training = value
 
 
 class Linear(Layer):
@@ -52,7 +62,6 @@ class BatchNorm1D(Layer):
         super().__init__()
         self.eps = eps
         self.momentum = momentum
-        self.training = True
 
         self.gamma = torch.ones(size)
         self.beta = torch.zeros(size)
@@ -141,6 +150,10 @@ class MLP:
         for p in self.parameters():
             p.grad = None
 
+    def eval(self):
+        for layer in self.layers:
+            layer.training = False
+
     def forward(
         self,
         mode: Literal["train", "test", "val"] = "train",
@@ -176,13 +189,13 @@ class MLP:
         return loss
 
     def fit(self, steps: int = 20000, lr: float = 0.1, batch_size: int = 32) -> None:
+        for layer in self.layers:
+            layer.training = True
+
         self.require_grad()
 
-        for i in range(steps):
+        for i in tqdm.tqdm(range(steps), desc="Train"):
             loss = self.forward("train", batch_size)
-
-            for layer in self.layers:
-                layer.out.retain_grad()
 
             self.zero_grad()
             loss.backward()
@@ -196,13 +209,11 @@ class MLP:
             for p in self.parameters():
                 p.data += -lr * p.grad
 
-            break
-
     def plot_activation_distribution(self) -> None:
         plt.figure(figsize=(20, 4))
         legends = []
         for i, layer in enumerate(self.layers[:-1]):
-            if not isinstance(layer, Linear):
+            if not isinstance(layer, Tanh):
                 continue
             t = layer.out
             legend = f"Layer #{i} ({layer.__class__.__name__})"
