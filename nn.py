@@ -3,10 +3,10 @@ import logging
 from typing import Optional, Literal
 
 import torch
+import tqdm
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import tqdm
 
 
 class Layer(abc.ABC):
@@ -70,9 +70,11 @@ class BatchNorm1D(Layer):
         self.track_var = torch.ones(size)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.ndim in (2, 3)
         if self.training:
-            x_mean = x.mean(0, keepdim=True)
-            x_var = x.var(0, keepdim=True)
+            dim = 0 if x.ndim == 2 else (0, 1)
+            x_mean = x.mean(dim, keepdim=True)
+            x_var = x.var(dim, keepdim=True)
 
             # update mean & variance buffers
             with torch.no_grad():
@@ -103,31 +105,42 @@ class Tanh(Layer):
         return []
 
 
-class MLP:
-    def __init__(
-        self,
-        layers: list[Layer],
-        data: tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-        ],
-        vocab_size: int,
-        emb_size: int = 10,
-    ):
-        self.emb = torch.randn(vocab_size, emb_size)
+class Embedding(Layer):
+    def __init__(self, num_emb: int, emb_dim: int):
+        super().__init__()
+        self._weights = torch.randn((num_emb, emb_dim))
+
+    def __call__(self, x: int | tuple[int, ...] | torch.Tensor) -> torch.Tensor:
+        self.out = self._weights[x]
+        return self.out
+
+    def parameters(self) -> list[torch.Tensor]:
+        return [self._weights]
+
+
+class ConsecutiveFlatten(Layer):
+    def __init__(self, n: int):
+        super().__init__()
+        self._n = n
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        x = x.view(b, t // self._n, c * self._n)
+
+        if x.shape[1] == 1:
+            x = x.squeeze(1)
+
+        self.out = x
+        return self.out
+
+    def parameters(self) -> list[torch.Tensor]:
+        return []
+
+
+class Sequential(Layer):
+    def __init__(self, layers: list[Layer]):
+        super().__init__()
         self.layers = layers
-        (
-            self.x_train,
-            self.y_train,
-            self.x_val,
-            self.y_val,
-            self.x_test,
-            self.y_test,
-        ) = data
 
         with torch.no_grad():
             for i, layer in enumerate(self.layers):
@@ -139,8 +152,51 @@ class MLP:
                         # apply gain
                         layer.weights *= 5 / 3
 
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        self.out = x
+        return self.out
+
+    @property
+    def training(self) -> bool:
+        return self._training
+
+    @training.setter
+    def training(self, value: bool) -> None:
+        for layer in self.layers:
+            layer.training = value
+        self._training = value
+
     def parameters(self) -> list[torch.Tensor]:
-        return [self.emb] + [p for layer in self.layers for p in layer.parameters()]
+        return [p for layer in self.layers for p in layer.parameters()]
+
+
+class MLP:
+    def __init__(
+        self,
+        model: Sequential,
+        data: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+    ):
+        self.model = model
+        (
+            self.x_train,
+            self.y_train,
+            self.x_val,
+            self.y_val,
+            self.x_test,
+            self.y_test,
+        ) = data
+
+    def parameters(self) -> list[torch.Tensor]:
+        return self.model.parameters()
 
     def require_grad(self) -> None:
         for p in self.parameters():
@@ -151,8 +207,7 @@ class MLP:
             p.grad = None
 
     def eval(self):
-        for layer in self.layers:
-            layer.training = False
+        self.model.training = False
 
     def forward(
         self,
@@ -176,22 +231,15 @@ class MLP:
                 x = x[batch]
                 y = y[batch]
 
-            x_emb = self.emb[x]
-            x = x_emb.view(x_emb.shape[0], -1)
-
-            for layer in self.layers:
-                x = layer(x)
-
-            loss = F.cross_entropy(x, y)
+            logits = self.model(x)
+            loss = F.cross_entropy(logits, y)
         finally:
             torch.set_grad_enabled(grad_state)
 
         return loss
 
     def fit(self, steps: int = 20000, lr: float = 0.1, batch_size: int = 32) -> None:
-        for layer in self.layers:
-            layer.training = True
-
+        self.model.training = True
         self.require_grad()
 
         for i in tqdm.tqdm(range(steps), desc="Train"):
@@ -200,19 +248,22 @@ class MLP:
             self.zero_grad()
             loss.backward()
 
-            lr = round(lr if i < 10000 else lr / i * 5000, 3)
-            if i % 10000 == 0:
-                logging.info(
+            lr = round(lr if i < 10000 else lr / 2, 3)
+            if i % 1000 == 0:
+                print(
                     f"{i:7d} / {steps:7d} - Training loss: {loss.item():.4f}, lr: {lr}"
                 )
 
             for p in self.parameters():
                 p.data += -lr * p.grad
 
+        for layer in self.model.layers:
+            print(layer.__class__.__name__, tuple(layer.out.shape))
+
     def plot_activation_distribution(self) -> None:
         plt.figure(figsize=(20, 4))
         legends = []
-        for i, layer in enumerate(self.layers[:-1]):
+        for i, layer in enumerate(self.model.layers[:-1]):
             if not isinstance(layer, Tanh):
                 continue
             t = layer.out

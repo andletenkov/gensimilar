@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 
 from data_utils import WordsDataset
-from nn import MLP, Linear, Tanh, BatchNorm1D
+from nn import MLP, Linear, Tanh, BatchNorm1D, Embedding, ConsecutiveFlatten, Sequential
 
 
 def generate(
@@ -21,13 +21,11 @@ def generate(
         current = None
 
         while current != end_token:
-            ctx_emb = model.emb[torch.tensor([ctx])]
-            x = ctx_emb.view(1, -1)
-
-            for layer in model.layers:
-                x = layer(x)
-
-            probs = torch.softmax(x, dim=1)
+            # ctx_emb = model.emb[torch.tensor([ctx])]
+            # x = ctx_emb.view(1, -1)
+            x = torch.tensor([ctx])
+            logits = model.model(x)
+            probs = torch.softmax(logits, dim=1)
 
             current = torch.multinomial(probs, num_samples=1).item()
             ctx = ctx[1:] + [current]
@@ -39,36 +37,36 @@ def generate(
 
 
 if __name__ == "__main__":
-    context_length = 5
-    embedding_size = 10
-    n_hidden = 100
+    context_length = 8
+    embedding_size = 24
+    n_hidden = 128
 
     dataset = WordsDataset(Path("surnames.txt"))
     mlp = MLP(
-        [
-            Linear(context_length * embedding_size, n_hidden),
-            BatchNorm1D(n_hidden),
-            Tanh(),
-            Linear(n_hidden, n_hidden),
-            BatchNorm1D(n_hidden),
-            Tanh(),
-            Linear(n_hidden, n_hidden),
-            BatchNorm1D(n_hidden),
-            Tanh(),
-            Linear(n_hidden, n_hidden),
-            BatchNorm1D(n_hidden),
-            Tanh(),
-            Linear(n_hidden, n_hidden),
-            BatchNorm1D(n_hidden),
-            Tanh(),
-            Linear(n_hidden, dataset.vocab_size),
-        ],
+        Sequential(
+            [
+                Embedding(num_emb=dataset.vocab_size, emb_dim=embedding_size),
+                ConsecutiveFlatten(2),
+                Linear(2 * embedding_size, n_hidden, bias=False),
+                BatchNorm1D(n_hidden),
+                Tanh(),
+                ConsecutiveFlatten(2),
+                Linear(2 * n_hidden, n_hidden, bias=False),
+                BatchNorm1D(n_hidden),
+                Tanh(),
+                ConsecutiveFlatten(2),
+                Linear(2 * n_hidden, n_hidden, bias=False),
+                BatchNorm1D(n_hidden),
+                Tanh(),
+                Linear(n_hidden, dataset.vocab_size),
+            ]
+
+        ),
         data=dataset.train_val_test_split(0.8, context_length),
-        vocab_size=dataset.vocab_size,
-        emb_size=embedding_size,
     )
     mlp.fit()
     # mlp.plot_activation_distribution()
 
     new = generate(mlp, context_length, dataset.token_map)
     print(new)
+
